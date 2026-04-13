@@ -3,21 +3,19 @@ import type { ComputerUseAPI } from '@ant/computer-use-swift'
 let cached: ComputerUseAPI | undefined
 
 /**
- * Package's js/index.js reads COMPUTER_USE_SWIFT_NODE_PATH (baked by
- * build-with-plugins.ts on darwin targets, unset otherwise — falls through to
- * the node_modules prebuilds/ path). We cache the loaded native module.
- *
- * The four @MainActor methods (captureExcluding, captureRegion,
- * apps.listInstalled, resolvePrepareCapture) dispatch to DispatchQueue.main
- * and will hang under libuv unless CFRunLoop is pumped — call sites wrap
- * these in drainRunLoop().
+ * macOS-only loader for @ant/computer-use-swift.
+ * Non-darwin platforms should use src/utils/computerUse/platforms/ instead.
  */
 export function requireComputerUseSwift(): ComputerUseAPI {
-  if (process.platform !== 'darwin') {
-    throw new Error('@ant/computer-use-swift is macOS-only')
-  }
+  if (cached) return cached
   // eslint-disable-next-line @typescript-eslint/no-require-imports
-  return (cached ??= require('@ant/computer-use-swift') as ComputerUseAPI)
+  const mod = require('@ant/computer-use-swift')
+  if (mod.ComputerUseAPI && typeof mod.ComputerUseAPI === 'function') {
+    cached = new mod.ComputerUseAPI() as ComputerUseAPI
+  } else {
+    cached = mod as ComputerUseAPI
+  }
+  return cached
 }
 
 export type { ComputerUseAPI }

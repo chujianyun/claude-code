@@ -452,7 +452,7 @@ describe("validateSettingsFileContent", () => {
     const result = validateSettingsFileContent("not json");
     expect(result.isValid).toBe(false);
     if (!result.isValid) {
-      expect(result.error).toContain("Invalid JSON");
+      expect((result as any).error).toContain("Invalid JSON");
     }
   });
 
@@ -472,5 +472,12 @@ describe("formatZodError", () => {
       expect(errors[0]!.file).toBe("settings.json");
       expect(errors[0]!.path).toContain("model");
     }
+  });
+});
+
+describe("gemini settings", () => {
+  test("accepts gemini modelType", () => {
+    const result = SettingsSchema().safeParse({ modelType: "gemini" });
+    expect(result.success).toBe(true);
   });
 });

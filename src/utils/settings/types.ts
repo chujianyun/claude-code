@@ -372,6 +372,13 @@ export const SettingsSchema = lazySchema(() =>
       permissions: PermissionsSchema()
         .optional()
         .describe('Tool usage permissions configuration'),
+      modelType: z
+        .enum(['anthropic', 'openai', 'gemini', 'grok'])
+        .optional()
+        .describe(
+          'API provider type. "anthropic" uses the Anthropic API (default), "openai" uses the OpenAI Chat Completions API, "gemini" uses the Gemini API, and "grok" uses the xAI Grok API (OpenAI-compatible). ' +
+            'When set to "openai", configure OPENAI_API_KEY, OPENAI_BASE_URL, and OPENAI_MODEL. When set to "gemini", configure GEMINI_API_KEY and optional GEMINI_BASE_URL. When set to "grok", configure GROK_API_KEY (or XAI_API_KEY), optional GROK_BASE_URL, GROK_MODEL, and GROK_MODEL_MAP.',
+        ),
       model: z
         .string()
         .optional()
@@ -731,6 +738,12 @@ export const SettingsSchema = lazySchema(() =>
         .describe(
           'When false, prompt suggestions are disabled. When absent or true, ' +
             'prompt suggestions are enabled.',
+        ),
+      poorMode: z
+        .boolean()
+        .optional()
+        .describe(
+          'When true, poor mode is active — extract_memories and prompt_suggestion are disabled to save tokens.',
         ),
       showClearContextOnPlanAccept: z
         .boolean()
@@ -1146,3 +1159,4 @@ export type PluginConfig = {
     [serverName: string]: UserConfigValues
   }
 }
+

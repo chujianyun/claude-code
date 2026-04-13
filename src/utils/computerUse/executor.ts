@@ -68,6 +68,24 @@ function computeTargetDims(
 }
 
 async function readClipboardViaPbpaste(): Promise<string> {
+  if (process.platform === 'win32') {
+    const { stdout, code } = await execFileNoThrow('powershell', ['-NoProfile', '-Command', 'Get-Clipboard'], {
+      useCwd: false,
+    })
+    if (code !== 0) {
+      throw new Error(`PowerShell Get-Clipboard exited with code ${code}`)
+    }
+    return stdout
+  }
+  if (process.platform === 'linux') {
+    const { stdout, code } = await execFileNoThrow('xclip', ['-selection', 'clipboard', '-o'], {
+      useCwd: false,
+    })
+    if (code !== 0) {
+      throw new Error(`xclip exited with code ${code}`)
+    }
+    return stdout
+  }
   const { stdout, code } = await execFileNoThrow('pbpaste', [], {
     useCwd: false,
   })
@@ -78,6 +96,25 @@ async function readClipboardViaPbpaste(): Promise<string> {
 }
 
 async function writeClipboardViaPbcopy(text: string): Promise<void> {
+  if (process.platform === 'win32') {
+    const { code } = await execFileNoThrow('powershell', ['-NoProfile', '-Command', `Set-Clipboard -Value '${text.replace(/'/g, "''")}'`], {
+      useCwd: false,
+    })
+    if (code !== 0) {
+      throw new Error(`PowerShell Set-Clipboard exited with code ${code}`)
+    }
+    return
+  }
+  if (process.platform === 'linux') {
+    const { code } = await execFileNoThrow('xclip', ['-selection', 'clipboard'], {
+      input: text,
+      useCwd: false,
+    })
+    if (code !== 0) {
+      throw new Error(`xclip exited with code ${code}`)
+    }
+    return
+  }
   const { code } = await execFileNoThrow('pbcopy', [], {
     input: text,
     useCwd: false,
@@ -192,7 +229,7 @@ async function typeViaClipboard(input: Input, text: string): Promise<void> {
     if ((await readClipboardViaPbpaste()) !== text) {
       throw new Error('Clipboard write did not round-trip.')
     }
-    await input.keys(['command', 'v'])
+    await input.keys([process.platform === 'darwin' ? 'command' : 'ctrl', 'v'])
     await sleep(100)
   } finally {
     if (typeof saved === 'string') {
@@ -260,16 +297,17 @@ export function createCliExecutor(opts: {
   getMouseAnimationEnabled: () => boolean
   getHideBeforeActionEnabled: () => boolean
 }): ComputerExecutor {
+  // Non-macOS: delegate entirely to the cross-platform executor.
+  // No macOS code paths, no drainRunLoop, no @ant packages.
   if (process.platform !== 'darwin') {
-    throw new Error(
-      `createCliExecutor called on ${process.platform}. Computer control is macOS-only.`,
-    )
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { createCrossPlatformExecutor } = require('./executorCrossPlatform.js') as typeof import('./executorCrossPlatform.js')
+    return createCrossPlatformExecutor(opts)
   }
 
-  // Swift loaded once at factory time — every executor method needs it.
-  // Input loaded lazily via requireComputerUseInput() on first mouse/keyboard
-  // call — it caches internally, so screenshot-only flows never pull the
-  // enigo .node.
+  // ── macOS: native @ant packages ─────────────────────────────────────
+  // Everything below is macOS-only. No platform checks needed.
+
   const cu = requireComputerUseSwift()
 
   const { getMouseAnimationEnabled, getHideBeforeActionEnabled } = opts
@@ -377,7 +415,7 @@ export function createCliExecutor(opts: {
         d.height,
         d.scaleFactor,
       )
-      return drainRunLoop(() =>
+      const raw = await drainRunLoop(() =>
         cu.resolvePrepareCapture(
           withoutTerminal(opts.allowedBundleIds),
           surrogateHost,
@@ -385,10 +423,21 @@ export function createCliExecutor(opts: {
           targetW,
           targetH,
           opts.preferredDisplayId,
-          opts.autoResolve,
-          opts.doHide,
         ),
       )
+      // Ensure the result has fields expected by toolCalls.ts (hidden, displayId).
+      // macOS native returns these from Swift; our cross-platform ComputerUseAPI
+      // returns {base64, width, height} — fill in the missing fields.
+      const baseResult = raw as Partial<ResolvePrepareCaptureResult> & { width?: number; height?: number }
+      return {
+        ...raw,
+        displayWidth: baseResult.displayWidth ?? baseResult.width,
+        displayHeight: baseResult.displayHeight ?? baseResult.height,
+        originX: baseResult.originX ?? 0,
+        originY: baseResult.originY ?? 0,
+        hidden: baseResult.hidden ?? [],
+        displayId: baseResult.displayId ?? opts.preferredDisplayId ?? d.displayId,
+      } as ResolvePrepareCaptureResult
     },
 
     /**
@@ -455,18 +504,12 @@ export function createCliExecutor(opts: {
     async key(keySequence: string, repeat?: number): Promise<void> {
       const input = requireComputerUseInput()
       const parts = keySequence.split('+').filter(p => p.length > 0)
-      // Bare-only: the CGEventTap checks event.flags.isEmpty so ctrl+escape
-      // etc. pass through without aborting.
       const isEsc = isBareEscape(parts)
       const n = repeat ?? 1
       await drainRunLoop(async () => {
         for (let i = 0; i < n; i++) {
-          if (i > 0) {
-            await sleep(8)
-          }
-          if (isEsc) {
-            notifyExpectedEscape()
-          }
+          if (i > 0) await sleep(8)
+          if (isEsc) notifyExpectedEscape()
           await input.keys(parts)
         }
       })
@@ -509,12 +552,9 @@ export function createCliExecutor(opts: {
     async type(text: string, opts: { viaClipboard: boolean }): Promise<void> {
       const input = requireComputerUseInput()
       if (opts.viaClipboard) {
-        // keys(['command','v']) inside needs the pump.
         await drainRunLoop(() => typeViaClipboard(input, text))
         return
       }
-      // `toolCalls.ts` handles the grapheme loop + 8ms sleeps and calls this
-      // once per grapheme. typeText doesn't dispatch to the main queue.
       await input.typeText(text)
     },
 
@@ -611,6 +651,10 @@ export function createCliExecutor(opts: {
     // ── App management ───────────────────────────────────────────────────
 
     async getFrontmostApp(): Promise<FrontmostApp | null> {
+      // When HWND is bound on Windows, operations go through SendMessage
+      // and don't touch the real foreground. Return the first allowed app
+      // so the frontmost gate in toolCalls.ts passes — the real foreground
+      // is irrelevant since we never touch it.
       const info = requireComputerUseInput().getFrontmostAppInfo()
       if (!info || !info.bundleId) return null
       return { bundleId: info.bundleId, displayName: info.appName }
@@ -653,6 +697,7 @@ export async function unhideComputerUseApps(
   bundleIds: readonly string[],
 ): Promise<void> {
   if (bundleIds.length === 0) return
+  if (process.platform !== 'darwin') return // non-macOS: no-op
   const cu = requireComputerUseSwift()
   await cu.apps.unhide([...bundleIds])
 }

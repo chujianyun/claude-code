@@ -20,6 +20,7 @@ import {
   isNotEmptyMessage,
   deriveUUID,
   normalizeMessages,
+  normalizeMessagesForAPI,
   isClassifierDenial,
   buildYoloRejectionMessage,
   buildClassifierUnavailableMessage,
@@ -85,9 +86,9 @@ describe("createAssistantMessage", () => {
   test("creates assistant message with string content", () => {
     const msg = createAssistantMessage({ content: "hello" });
     expect(msg.type).toBe("assistant");
-    expect(msg.message.role).toBe("assistant");
-    expect(msg.message.content).toHaveLength(1);
-    expect((msg.message.content[0] as any).text).toBe("hello");
+    expect(msg.message!.role).toBe("assistant");
+    expect(msg.message!.content![0] as any).toBeTruthy();
+    expect((msg.message!.content![0] as any).text).toBe("hello");
   });
 
   test("creates assistant message with content blocks", () => {
@@ -375,6 +376,16 @@ describe("isNotEmptyMessage", () => {
     };
     expect(isNotEmptyMessage(msg)).toBe(true);
   });
+
+  test("returns false for whitespace-only text block in content array", () => {
+    const msg: any = {
+      type: "user",
+      message: {
+        content: [{ type: "text", text: "  " }],
+      },
+    };
+    expect(isNotEmptyMessage(msg)).toBe(false);
+  });
 });
 
 // ─── deriveUUID ─────────────────────────────────────────────────────────
@@ -458,6 +469,11 @@ describe("normalizeMessages", () => {
     ]);
     const normalized = normalizeMessages([msg]);
     expect(normalized.length).toBe(2);
+    // Verify each split message contains only one content block
+    expect(normalized[0].message.content).toHaveLength(1);
+    expect((normalized[0].message.content as any[])[0].text).toBe("first");
+    expect(normalized[1].message.content).toHaveLength(1);
+    expect((normalized[1].message.content as any[])[0].text).toBe("second");
   });
 
   test("handles empty array", () => {
@@ -469,5 +485,25 @@ describe("normalizeMessages", () => {
     const msg = makeAssistantMsg([{ type: "text", text: "hello" }]);
     const normalized = normalizeMessages([msg]);
     expect(normalized.length).toBe(1);
+  });
+});
+
+describe("normalizeMessagesForAPI", () => {
+  test("preserves Gemini thought signature metadata on tool_use blocks", () => {
+    const assistant = makeAssistantMsg([
+      {
+        type: "tool_use",
+        id: "tool-1",
+        name: "Bash",
+        input: { command: "pwd" },
+        _geminiThoughtSignature: "sig-123",
+      },
+    ]);
+
+    const normalized = normalizeMessagesForAPI([assistant]);
+    const block = (normalized[0] as AssistantMessage).message!.content![0] as any;
+
+    expect(block.type).toBe("tool_use");
+    expect(block._geminiThoughtSignature).toBe("sig-123");
   });
 });

@@ -36,7 +36,7 @@ import {
   type Tools,
   toolMatchesName,
 } from '../../Tool.js'
-import type { AgentDefinition } from '../../tools/AgentTool/loadAgentsDir.js'
+import type { AgentDefinition } from '@claude-code-best/builtin-tools/tools/AgentTool/loadAgentsDir.js'
 import {
   type ConnectorTextBlock,
   type ConnectorTextDelta,
@@ -195,7 +195,7 @@ import {
   formatDeferredToolLine,
   isDeferredTool,
   TOOL_SEARCH_TOOL_NAME,
-} from '../../tools/ToolSearchTool/prompt.js'
+} from '@claude-code-best/builtin-tools/tools/ToolSearchTool/prompt.js'
 import { count } from '../../utils/array.js'
 import { insertBlockAfterToolResults } from '../../utils/contentArray.js'
 import { validateBoundedIntEnvVar } from '../../utils/envValidation.js'
@@ -228,6 +228,9 @@ import {
 } from '../compact/microCompact.js'
 import { getInitializationStatus } from '../lsp/manager.js'
 import { isToolFromMcpServer } from '../mcp/utils.js'
+import { recordLLMObservation } from '../langfuse/index.js'
+import type { LangfuseSpan } from '../langfuse/index.js'
+import { convertMessagesToLangfuse, convertOutputToLangfuse } from '../langfuse/convert.js'
 import { withStreamingVCR, withVCR } from '../vcr.js'
 import { CLIENT_REQUEST_ID_HEADER, getAnthropicClient } from './client.js'
 import {
@@ -297,20 +300,6 @@ export function getExtraBodyParams(betaHeaders?: string[]): JsonObject {
         { level: 'error' },
       )
     }
-  }
-
-  // Anti-distillation: send fake_tools opt-in for 1P CLI only
-  if (
-    feature('ANTI_DISTILLATION_CC')
-      ? process.env.CLAUDE_CODE_ENTRYPOINT === 'cli' &&
-        shouldIncludeFirstPartyOnlyBetas() &&
-        getFeatureValue_CACHED_MAY_BE_STALE(
-          'tengu_anti_distill_fake_tool_injection',
-          false,
-        )
-      : false
-  ) {
-    result.anti_distillation = ['fake_tools']
   }
 
   // Handle beta headers if provided
@@ -593,13 +582,13 @@ export function userMessageToMessageParam(
   querySource?: QuerySource,
 ): MessageParam {
   if (addCache) {
-    if (typeof message.message.content === 'string') {
+    if (typeof message.message!.content === 'string') {
       return {
         role: 'user',
         content: [
           {
             type: 'text',
-            text: message.message.content,
+            text: message.message!.content,
             ...(enablePromptCaching && {
               cache_control: getCacheControl({ querySource }),
             }),
@@ -609,9 +598,9 @@ export function userMessageToMessageParam(
     } else {
       return {
         role: 'user',
-        content: message.message.content.map((_, i) => ({
+        content: message.message!.content!.map((_, i) => ({
           ..._,
-          ...(i === message.message.content.length - 1
+          ...(i === message.message!.content!.length - 1
             ? enablePromptCaching
               ? { cache_control: getCacheControl({ querySource }) }
               : {}
@@ -625,9 +614,9 @@ export function userMessageToMessageParam(
   // to addCacheBreakpoints share the same array and each splices in duplicate cache_edits.
   return {
     role: 'user',
-    content: Array.isArray(message.message.content)
-      ? [...message.message.content]
-      : message.message.content,
+    content: (Array.isArray(message.message!.content)
+      ? [...message.message!.content]
+      : message.message!.content) as import('@anthropic-ai/sdk/resources/beta/messages/messages.js').BetaContentBlockParam[],
   }
 }
 
@@ -638,13 +627,13 @@ export function assistantMessageToMessageParam(
   querySource?: QuerySource,
 ): MessageParam {
   if (addCache) {
-    if (typeof message.message.content === 'string') {
+    if (typeof message.message!.content === 'string') {
       return {
         role: 'assistant',
         content: [
           {
             type: 'text',
-            text: message.message.content,
+            text: message.message!.content,
             ...(enablePromptCaching && {
               cache_control: getCacheControl({ querySource }),
             }),
@@ -654,24 +643,50 @@ export function assistantMessageToMessageParam(
     } else {
       return {
         role: 'assistant',
-        content: message.message.content.map((_, i) => ({
-          ..._,
-          ...(i === message.message.content.length - 1 &&
-          _.type !== 'thinking' &&
-          _.type !== 'redacted_thinking' &&
-          (feature('CONNECTOR_TEXT') ? !isConnectorTextBlock(_) : true)
-            ? enablePromptCaching
-              ? { cache_control: getCacheControl({ querySource }) }
-              : {}
-            : {}),
-        })),
+        content: message.message!.content!.map((_, i) => {
+          const contentBlock = stripGeminiProviderMetadata(_)
+          return {
+            ...contentBlock,
+            ...(i === message.message!.content!.length - 1 &&
+            contentBlock.type !== 'thinking' &&
+            contentBlock.type !== 'redacted_thinking' &&
+            (feature('CONNECTOR_TEXT')
+              ? !isConnectorTextBlock(contentBlock)
+              : true)
+              ? enablePromptCaching
+                ? { cache_control: getCacheControl({ querySource }) }
+                : {}
+              : {}),
+          }
+        }),
       }
     }
   }
   return {
     role: 'assistant',
-    content: message.message.content,
+    content:
+      typeof message.message!.content === 'string'
+        ? message.message!.content
+        : message.message!.content!.map(stripGeminiProviderMetadata) as BetaContentBlockParam[],
   }
+}
+
+function stripGeminiProviderMetadata<T extends BetaContentBlockParam | string>(
+  contentBlock: T,
+): T {
+  if (
+    typeof contentBlock === 'string' ||
+    !('_geminiThoughtSignature' in (contentBlock as object))
+  ) {
+    return contentBlock
+  }
+
+  const obj = contentBlock as unknown as Record<string, unknown>
+  const {
+    _geminiThoughtSignature: _unusedGeminiThoughtSignature,
+    ...rest
+  } = obj
+  return rest as unknown as T
 }
 
 export type Options = {
@@ -705,6 +720,8 @@ export type Options = {
   // so the model can pace itself. `remaining` is computed by the caller
   // (query.ts decrements across the agentic loop).
   taskBudget?: { total: number; remaining?: number }
+  /** Langfuse root trace span for observability. No-op if null/undefined. */
+  langfuseTrace?: LangfuseSpan | null
 }
 
 export async function queryModelWithoutStreaming({
@@ -960,8 +977,8 @@ export function stripExcessMediaItems(
 ): (UserMessage | AssistantMessage)[] {
   let toRemove = 0
   for (const msg of messages) {
-    if (!Array.isArray(msg.message.content)) continue
-    for (const block of msg.message.content) {
+    if (!Array.isArray(msg.message!.content)) continue
+    for (const block of msg.message!.content) {
       if (isMedia(block)) toRemove++
       if (isToolResult(block) && Array.isArray(block.content)) {
         for (const nested of block.content) {
@@ -975,7 +992,7 @@ export function stripExcessMediaItems(
 
   return messages.map(msg => {
     if (toRemove <= 0) return msg
-    const content = msg.message.content
+    const content = msg.message!.content
     if (!Array.isArray(content)) return msg
 
     const before = toRemove
@@ -1314,6 +1331,34 @@ async function* queryModel(
     messagesForAPI,
     API_MAX_MEDIA_PER_REQUEST,
   )
+
+  // OpenAI-compatible provider: delegate to the OpenAI adapter layer
+  // after shared preprocessing (message normalization, tool filtering,
+  // media stripping) but before Anthropic-specific logic (betas, thinking, caching).
+  if (getAPIProvider() === 'openai') {
+    const { queryModelOpenAI } = await import('./openai/index.js')
+    yield* queryModelOpenAI(messagesForAPI, systemPrompt, filteredTools, signal, options)
+    return
+  }
+
+  if (getAPIProvider() === 'gemini') {
+    const { queryModelGemini } = await import('./gemini/index.js')
+    yield* queryModelGemini(
+      messagesForAPI,
+      systemPrompt,
+      filteredTools,
+      signal,
+      options,
+      thinkingConfig,
+    )
+    return
+  }
+
+  if (getAPIProvider() === 'grok') {
+    const { queryModelGrok } = await import('./grok/index.js')
+    yield* queryModelGrok(messagesForAPI, systemPrompt, filteredTools, signal, options)
+    return
+  }
 
   // Instrumentation: Track message count after normalization
   logEvent('tengu_api_after_normalize', {
@@ -2855,6 +2900,24 @@ async function* queryModel(
   // limit) until getToolPermissionContext() resolves.
   const logMessageCount = messagesForAPI.length
   const logMessageTokens = tokenCountFromLastAPIResponse(messagesForAPI)
+
+  // Record LLM observation in Langfuse (no-op if not configured)
+  recordLLMObservation(options.langfuseTrace ?? null, {
+    model: resolvedModel,
+    provider: getAPIProvider(),
+    input: convertMessagesToLangfuse(messagesForAPI, systemPrompt),
+    output: convertOutputToLangfuse(newMessages),
+    usage: {
+      input_tokens: usage.input_tokens,
+      output_tokens: usage.output_tokens,
+      cache_creation_input_tokens: usage.cache_creation_input_tokens,
+      cache_read_input_tokens: usage.cache_read_input_tokens,
+    },
+    startTime: new Date(startIncludingRetries),
+    endTime: new Date(),
+    completionStartTime: ttftMs > 0 ? new Date(start + ttftMs) : undefined,
+  })
+
   void options.getToolPermissionContext().then(permissionContext => {
     logAPISuccessAndDuration({
       model:

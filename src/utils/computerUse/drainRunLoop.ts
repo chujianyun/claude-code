@@ -18,7 +18,7 @@ let pump: ReturnType<typeof setInterval> | undefined
 let pending = 0
 
 function drainTick(cu: ReturnType<typeof requireComputerUseSwift>): void {
-  ;(cu as any)._drainMainRunLoop()
+  ;(cu as any)?._drainMainRunLoop?.()
 }
 
 function retain(): void {
@@ -59,6 +59,7 @@ export const releasePump = release
  * concurrent drainRunLoop() calls share one setInterval.
  */
 export async function drainRunLoop<T>(fn: () => Promise<T>): Promise<T> {
+  if (process.platform !== 'darwin') return fn()
   retain()
   let timer: ReturnType<typeof setTimeout> | undefined
   try {

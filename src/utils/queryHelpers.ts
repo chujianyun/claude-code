@@ -8,14 +8,14 @@ import type { SDKMessage } from 'src/entrypoints/agentSdkTypes.js'
 import type { CanUseToolFn } from '../hooks/useCanUseTool.js'
 import { runTools } from '../services/tools/toolOrchestration.js'
 import { findToolByName, type Tool, type Tools } from '../Tool.js'
-import { BASH_TOOL_NAME } from '../tools/BashTool/toolName.js'
-import { FILE_EDIT_TOOL_NAME } from '../tools/FileEditTool/constants.js'
-import type { Input as FileReadInput } from '../tools/FileReadTool/FileReadTool.js'
+import { BASH_TOOL_NAME } from '@claude-code-best/builtin-tools/tools/BashTool/toolName.js'
+import { FILE_EDIT_TOOL_NAME } from '@claude-code-best/builtin-tools/tools/FileEditTool/constants.js'
+import type { Input as FileReadInput } from '@claude-code-best/builtin-tools/tools/FileReadTool/FileReadTool.js'
 import {
   FILE_READ_TOOL_NAME,
   FILE_UNCHANGED_STUB,
-} from '../tools/FileReadTool/prompt.js'
-import { FILE_WRITE_TOOL_NAME } from '../tools/FileWriteTool/prompt.js'
+} from '@claude-code-best/builtin-tools/tools/FileReadTool/prompt.js'
+import { FILE_WRITE_TOOL_NAME } from '@claude-code-best/builtin-tools/tools/FileWriteTool/prompt.js'
 import type { Message } from '../types/message.js'
 import type { OrphanedPermission } from '../types/textInputTypes.js'
 import { logForDebugging } from './debug.js'
@@ -45,6 +45,14 @@ export type PermissionPromptTool = Tool<
 // during permission prompts or limited tool operations
 const ASK_READ_FILE_STATE_CACHE_SIZE = 10
 
+/** Transcript JSON may deserialize Write tool `content` as a nested object — LRU needs strings. */
+function coerceToolContentToString(value: unknown): string {
+  if (typeof value === 'string') return value
+  if (value === null || value === undefined) return ''
+  if (typeof value === 'object') return JSON.stringify(value)
+  return String(value)
+}
+
 /**
  * Checks if the result should be considered successful based on the last message.
  * Returns true if:
@@ -60,7 +68,8 @@ export function isResultSuccessful(
   if (!message) return false
 
   if (message.type === 'assistant') {
-    const lastContent = last(message.message.content)
+    const content = message.message!.content
+    const lastContent = Array.isArray(content) ? content[content.length - 1] : undefined
     return (
       lastContent?.type === 'text' ||
       lastContent?.type === 'thinking' ||
@@ -70,7 +79,7 @@ export function isResultSuccessful(
 
   if (message.type === 'user') {
     // Check if all content blocks are tool_result type
-    const content = message.message.content
+    const content = message.message!.content
     if (
       Array.isArray(content) &&
       content.length > 0 &&
@@ -315,8 +324,8 @@ export async function* handleOrphanedPermission(
   const alreadyPresent = mutableMessages.some(
     m =>
       m.type === 'assistant' &&
-      Array.isArray(m.message.content) &&
-      m.message.content.some(
+      Array.isArray(m.message!.content) &&
+      m.message!.content.some(
         b => b.type === 'tool_use' && 'id' in b && b.id === toolUseID,
       ),
   )
@@ -377,9 +386,9 @@ export function extractReadFilesFromMessages(
   for (const message of messages) {
     if (
       message.type === 'assistant' &&
-      Array.isArray(message.message.content)
+      Array.isArray(message.message!.content)
     ) {
-      for (const content of message.message.content) {
+      for (const content of message.message!.content) {
         if (
           content.type === 'tool_use' &&
           content.name === FILE_READ_TOOL_NAME
@@ -402,14 +411,18 @@ export function extractReadFilesFromMessages(
         ) {
           // Extract file_path and content from the Write tool use input
           const input = content.input as
-            | { file_path?: string; content?: string }
+            | { file_path?: string; content?: unknown }
             | undefined
-          if (input?.file_path && input?.content) {
+          if (
+            input?.file_path &&
+            input.content !== undefined &&
+            input.content !== null
+          ) {
             // Normalize to absolute path for consistent cache lookups
             const absolutePath = expandPath(input.file_path, cwd)
             fileWriteToolUseIds.set(content.id, {
               filePath: absolutePath,
-              content: input.content,
+              content: coerceToolContentToString(input.content),
             })
           }
         } else if (
@@ -430,8 +443,8 @@ export function extractReadFilesFromMessages(
 
   // Second pass: find corresponding tool results and extract content
   for (const message of messages) {
-    if (message.type === 'user' && Array.isArray(message.message.content)) {
-      for (const content of message.message.content) {
+    if (message.type === 'user' && Array.isArray(message.message!.content)) {
+      for (const content of message.message!.content) {
         if (content.type === 'tool_result' && content.tool_use_id) {
           // Handle Read tool results
           const readFilePath = fileReadToolUseIds.get(content.tool_use_id)
@@ -525,9 +538,9 @@ export function extractBashToolsFromMessages(messages: Message[]): Set<string> {
   for (const message of messages) {
     if (
       message.type === 'assistant' &&
-      Array.isArray(message.message.content)
+      Array.isArray(message.message!.content)
     ) {
-      for (const content of message.message.content) {
+      for (const content of message.message!.content) {
         if (content.type === 'tool_use' && content.name === BASH_TOOL_NAME) {
           const { input } = content
           if (
